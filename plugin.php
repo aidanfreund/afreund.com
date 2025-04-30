@@ -1,8 +1,8 @@
 <?php
 /*
 Plugin Name: Weather Calendar Sync
-Description: Updates Google Calendar availability based on a 5-day weather forecast. Using Openweather.com API
-Version: 1.1
+Description: Updates Google Calendar availability based on a 5-day weather forecast.
+Version: 1.3
 Author: Aidan Freund
 */
 
@@ -10,8 +10,8 @@ Author: Aidan Freund
 define('OPENWEATHERMAP_API_KEY', 'eba978219989d8d57de08885c602885');
 define('WEATHER_LATITUDE', '40.514202');
 define('WEATHER_LONGITUDE', '-88.990631');
-define('MAX_TEMPERATURE_CELSIUS', 30); // Busy if temperature exceeds 30°C
-define('RAIN_THRESHOLD', true); // Book if any rain is expected
+define('MAX_TEMPERATURE_CELSIUS', 30); // Example: Book if temperature exceeds 30°C
+define('RAIN_THRESHOLD', true); // Example: Book if rain is expected
 
 // Schedule the event (run daily for forecast)
 add_action('wp', 'schedule_weather_calendar_sync');
@@ -96,4 +96,39 @@ function update_calendar_based_on_forecast_function() {
                             'timeZone' => 'America/Chicago',
                         ),
                         'end' => array(
-                            'dateTime' => $endDateTime->format(
+                            'dateTime' => $endDateTime->format(DateTime::RFC3339),
+                            'timeZone' => 'America/Chicago',
+                        ),
+                    ));
+
+                    // Check if an event already exists for this day to avoid duplicates
+                    $events = $service->events->listEvents($calendarId, array(
+                        'timeMin' => $startDateTime->format(DateTime::RFC3339),
+                        'timeMax' => $endDateTime->format(DateTime::RFC3339),
+                        'singleEvents' => true,
+                        'q' => 'Unavailable due to rain', // Basic check, can be improved
+                    ));
+
+                    $heatEvents = $service->events->listEvents($calendarId, array(
+                        'timeMin' => $startDateTime->format(DateTime::RFC3339),
+                        'timeMax' => $endDateTime->format(DateTime::RFC3339),
+                        'singleEvents' => true,
+                        'q' => 'Unavailable due to heat', // Basic check, can be improved
+                    ));
+
+                    if (empty($events->getItems()) && $isRaining) {
+                        $createdEvent = $service->events->insert($calendarId, $event);
+                        error_log('Rain event created: ' . $createdEvent->getHtmlLink());
+                    } elseif (empty($heatEvents->getItems()) && $isTooHot) {
+                        $createdEvent = $service->events->insert($calendarId, $event);
+                        error_log('Heat event created: ' . $createdEvent->getHtmlLink());
+                    }
+                }
+            }
+        }
+    } catch (Google_Service_Exception $e) {
+        error_log('Google Calendar API error: ' . $e->getMessage());
+    } catch (Exception $e) {
+        error_log('An error occurred: ' . $e->getMessage());
+    }
+}
