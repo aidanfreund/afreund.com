@@ -1,0 +1,148 @@
+<?php
+/*
+Plugin Name: Weather Calendar Sync
+Description: Updates Google Calendar availability based on a 5-day weather forecast.
+Version: 1.3
+Author: Aidan Freund
+*/
+
+// Define constants for API key, coordinates, and thresholds
+define('OPENWEATHERMAP_API_KEY', 'eba978219989d8d57de08885c602885');
+define('WEATHER_LATITUDE', '40.514202');
+define('WEATHER_LONGITUDE', '-88.990631');
+define('MAX_TEMPERATURE_CELSIUS', 30); // Example: Book if temperature exceeds 30°C
+define('RAIN_THRESHOLD', true); // Example: Book if rain is expected
+define('PLUGIN_EVENT_SOURCE', 'weather_calendar_sync'); // Unique identifier for events
+
+// Schedule the event (run daily for forecast)
+add_action('wp', 'schedule_weather_calendar_sync');
+function schedule_weather_calendar_sync() {
+    if (!wp_next_scheduled('update_calendar_based_on_forecast')) {
+        wp_schedule_event(strtotime('00:00 tomorrow'), 'daily', 'update_calendar_based_on_forecast');
+    }
+}
+
+// Hook the function to the scheduled event
+add_action('update_calendar_based_on_forecast', 'update_calendar_based_on_forecast_function');
+
+// Run the update function on plugin activation for immediate testing
+register_activation_hook(__FILE__, 'run_weather_calendar_sync_on_activation');
+function run_weather_calendar_sync_on_activation() {
+    update_calendar_based_on_forecast_function();
+}
+
+// Function to update calendar based on 5-day weather forecast
+function update_calendar_based_on_forecast_function() {
+    $apiKey = OPENWEATHERMAP_API_KEY;
+    $latitude = WEATHER_LATITUDE;
+    $longitude = WEATHER_LONGITUDE;
+    $forecastUrl = "http://api.openweathermap.org/data/2.5/forecast?lat={$latitude}&lon={$longitude}&appid={$apiKey}&units=metric"; // Using metric for Celsius
+
+    $response = wp_remote_get($forecastUrl);
+
+    if (is_wp_error($response)) {
+        error_log('Error fetching weather forecast: ' . $response->get_error_message());
+        return;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $forecastData = json_decode($body, true);
+
+    if (empty($forecastData) || !isset($forecastData['list'])) {
+        error_log('Error decoding weather forecast data.');
+        return;
+    }
+
+    // Include the Google API client library
+    require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
+
+    $client = new Google_Client();
+    $client->setApplicationName('weatherintegration');
+    $client->setScopes(Google_Service_Calendar::CALENDAR);
+    $client->setAuthConfig(plugin_dir_path(__FILE__) . 'credentials.json'); // Ensure credentials.json is in your plugin directory
+
+    try {
+        $service = new Google_Service_Calendar($client);
+        $calendarId = 'primary';
+
+        foreach ($forecastData['list'] as $forecastItem) {
+            $timestamp = $forecastItem['dt'];
+            $forecastDate = new DateTime('@' . $timestamp);
+            $forecastDate->setTimezone(new DateTimeZone('America/Chicago'));
+            $today = new DateTime('now', new DateTimeZone('America/Chicago'));
+            $today->setTime(0, 0, 0);
+            $diff = $today->diff($forecastDate)->days;
+
+            // Only process the forecast for the next 5 days
+            if ($diff >= 0 && $diff < 5) {
+                $isRaining = false;
+                if (isset($forecastItem['weather']) && is_array($forecastItem['weather'])) {
+                    foreach ($forecastItem['weather'] as $weatherCondition) {
+                        if (RAIN_THRESHOLD && strpos(strtolower($weatherCondition['main']), 'rain') !== false) {
+                            $isRaining = true;
+                            break;
+                        }
+                    }
+                }
+
+                $isTooHot = false;
+                if (isset($forecastItem['main']) && isset($forecastItem['main']['temp']) && $forecastItem['main']['temp'] > MAX_TEMPERATURE_CELSIUS) {
+                    $isTooHot = true;
+                }
+
+                if ($isRaining || $isTooHot) {
+                    $startDateTime = clone $forecastDate;
+                    $startDateTime->setTime(9, 0, 0); // Set start time to 9:00 AM
+                    $endDateTime = clone $forecastDate;
+                    $endDateTime->setTime(17, 0, 0); // Set end time to 5:00 PM
+
+                    $eventSummary = ($isRaining ? 'Unavailable due to rain' : '') . ($isRaining && $isTooHot ? ' and ' : '') . ($isTooHot ? 'Unavailable due to heat' : '');
+
+                    $event = new Google_Service_Calendar_Event(array(
+                        'summary' => $eventSummary,
+                        'start' => array(
+                            'dateTime' => $startDateTime->format(DateTime::RFC3339),
+                            'timeZone' => 'America/Chicago',
+                        ),
+                        'end' => array(
+                            'dateTime' => $endDateTime->format(DateTime::RFC3339),
+                            'timeZone' => 'America/Chicago',
+                        ),
+                        'extendedProperties' => array(
+                            'private' => array(
+                                'source' => PLUGIN_EVENT_SOURCE,
+                            ),
+                        ),
+                    ));
+
+                    // Check if an event already exists for this day based on the source
+                    $events = $service->events->listEvents($calendarId, array(
+                        'timeMin' => $startDateTime->format(DateTime::RFC3339),
+                        'timeMax' => $endDateTime->format(DateTime::RFC3339),
+                        'singleEvents' => true,
+                        'privateExtendedProperty' => 'source=' . PLUGIN_EVENT_SOURCE,
+                    ));
+
+                    $eventExists = false;
+                    foreach ($events->getItems() as $existingEvent) {
+                        if ($existingEvent->getSummary() === $eventSummary) {
+                            $eventExists = true;
+                            break;
+                        }
+                    }
+
+                    if (!$eventExists) {
+                        $createdEvent = $service->events->insert($calendarId, $event);
+                        error_log('Calendar event created: ' . $createdEvent->getHtmlLink() . ' - Summary: ' . $eventSummary);
+                    } else {
+                        error_log('Calendar event already exists for ' . $startDateTime->format('Y-m-d') . ' due to ' . ($isRaining ? 'rain' : 'heat'));
+                    }
+                }
+            }
+        }
+    } catch (Google_Service_Exception $e) {
+        error_log('Google Calendar API error: ' . $e->getMessage());
+    } catch (Exception $e) {
+        error_log('An error occurred: ' . $e->getMessage());
+    }
+}
